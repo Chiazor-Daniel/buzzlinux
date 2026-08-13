@@ -4,14 +4,23 @@ on:
   schedule:
     # Runs every 30 minutes in the cloud
     - cron: '*/30 * * * *'
-  workflow_dispatch: # Allows manual trigger testing
+  workflow_dispatch:
 
 jobs:
-  ping:
+  ping-buzzlinux:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Codespace
+      - name: Ping Buzzlinux Codespace
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           gh codespace ssh -c fantastic-broccoli-rqgwxqxr9wwhp97p -- "echo action-ping"
+
+  ping-myechoboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping MyEchoBoard Codespace
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh codespace ssh -c turbo-space-zebra-5g7655vgpjw27ggq -- "echo action-ping"
