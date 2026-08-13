@@ -1,0 +1,17 @@
+name: Codespace Keepalive Ping
+
+on:
+  schedule:
+    # Runs every 30 minutes in the cloud
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Allows manual trigger testing
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Codespace
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+        run: |
+          gh codespace ssh -c fantastic-broccoli-rqgwxqxr9wwhp97p -- "echo action-ping"
