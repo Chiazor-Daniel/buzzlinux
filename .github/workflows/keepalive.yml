@@ -23,4 +23,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh codespace ssh -c turbo-space-zebra-5g7655vgpjw27ggq -- "echo action-ping"
+          gh codespace ssh -c turbo-space-zebra-5jq59j949r7375p5 -- "echo action-ping"
