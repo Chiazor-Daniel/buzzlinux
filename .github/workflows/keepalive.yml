@@ -12,6 +12,6 @@ jobs:
     steps:
       - name: Ping Codespace
         env:
-          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           gh codespace ssh -c fantastic-broccoli-rqgwxqxr9wwhp97p -- "echo action-ping"
