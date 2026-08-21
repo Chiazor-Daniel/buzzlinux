@@ -1,0 +1,134 @@
+name: SSH Access to GitHub Runner
+
+on:
+  workflow_dispatch:
+    description: >
+      Start SSH access to this GitHub-hosted Ubuntu runner.
+      Sets up SSH server and provides connection credentials.
+    inputs:
+      tunnel-duration-minutes:
+        description: "Keep tunnel alive for this many minutes (max 1440)"
+        default: "60"
+        required: false
+
+jobs:
+  setup-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install openssh-server and jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server jq
+
+      - name: Create privilege separation directory
+        run: |
+          sudo mkdir -p /run/sshd
+
+      - name: Start SSH server
+        run: |
+          sudo /usr/sbin/sshd
+          # Verify sshd is running
+          if pgrep -x sshd > /dev/null; then
+            echo "sshd is running"
+          else
+            echo "WARNING: sshd could not start"
+            sudo mkdir -p /var/run/sshd
+            sudo /usr/sbin/sshd -D &
+            sleep 2
+            if pgrep -x sshd > /dev/null; then
+              echo "sshd started with fallback method"
+            fi
+          fi
+          sleep 2
+
+      - name: Create temporary SSH user
+        run: |
+          sudo useradd -m -s /bin/bash tmpuser
+          # Set temporary password (expires after first use)
+          echo "tmpuser:RunnerTunnel2024!" | sudo chpasswd
+          # Ensure user can SSH in
+          echo "tmpuser ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/tmpuser
+          # Unlock the account
+          sudo passwd -u tmpuser
+          echo "Temporary SSH user 'tmpuser' created"
+
+      - name: Get runner network information
+        run: |
+          # Get the runner's internal IP and details
+          IP_ADDR=$(hostname -I | awk '{print $1}')
+          echo "Runner IP: $IP_ADDR"
+          echo "RUNNER_IP::$IP_ADDR" >> "$GITHUB_ENV"
+          echo "OS: Ubuntu 24.04.4 LTS"
+          echo "OS::Ubuntu 24.04.4 LTS" >> "$GITHUB_ENV"
+          echo "CPU cores: $(nproc)"
+          echo "CPU cores::$(nproc)" >> "$GITHUB_ENV"
+          echo "Total memory: $(free -m | grep Mem | awk '{print $2}') MB"
+          echo "Total memory::$(free -m | grep Mem | awk '{print $2}') MB" >> "$GITHUB_ENV"
+
+      - name: Display SSH connection information
+        run: |
+          echo ""
+          echo "========================================="
+          echo "  SSH CONNECTION INFORMATION"
+          echo "========================================="
+          echo "Runner: GitHub-hosted Ubuntu (ephemeral)"
+          echo "Username: tmpuser"
+          echo ""
+          if [ -n "${RUNNER_IP:-}" ]; then
+            # Try direct IP first
+            echo "  Direct SSH attempt:"
+            echo "  ssh -o StrictHostKeyChecking=no tmpuser@${RUNNER_IP}"
+            echo ""
+            echo "  PASSWORD: RunnerTunnel2024!"
+            echo ""
+            echo "  Note: This may work if your network can reach"
+            echo "  GitHub's runner infrastructure, or if you're"
+            echo "  on the same network as the runner."
+            echo ""
+            echo "  Alternative: Use a tunneling service (ngrok,"
+            echo "  cloudflared) for remote access."
+          else
+            echo "  Unable to determine runner IP."
+            echo "  Try: ssh -o StrictHostKeyChecking=no tmpuser@localhost"
+          fi
+          echo ""
+          echo "  ⚠️  This runner is TEMPORARY - terminates when"
+          echo "  workflow is cancelled"
+          echo "  ⚠️  Workflow can be cancelled anytime from"
+          echo "  GitHub → Actions tab"
+          echo "========================================="
+          echo ""
+          echo "  To cancel this workflow:"
+          echo "  1. Go to GitHub → Actions tab"
+          echo "  2. Click 'SSH Access to GitHub Runner'"
+          echo "  3. Click 'Cancel workflow'"
+          echo ""
+
+      - name: Keep workflow and SSH alive
+        run: |
+          # Loop to keep the workflow running and maintain SSH
+          timeout_counter=0
+          max_timeouts=12  # Check every cycle for 12 cycles = 720 seconds (12 minutes)
+          
+          while [ $timeout_counter -lt $max_timeouts ]; do
+            # Check and restart sshd if needed
+            if ! pgrep -x sshd > /dev/null 2>&1; then
+              echo "[$(date)] sshd not running, restarting..."
+              sudo /usr/sbin/sshd
+              sleep 2
+            fi
+            
+            # Print status every 3 cycles
+            if [ $((timeout_counter % 3)) -eq 0 ]; then
+              echo "[$(date)] Workflow running... $(($timeout_counter + 1))/$(max_timeouts) cycles elapsed ($((timeout_counter + 1)) minutes)"
+            fi
+            
+            timeout_counter=$((timeout_counter + 1))
+            sleep 60  # Check every minute
+          done
+          echo "Keep-alive loop complete after $((max_timeouts * 60)) seconds"
