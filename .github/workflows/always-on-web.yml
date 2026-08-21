@@ -1,0 +1,43 @@
+name: Max-Duration Web Service
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    steps:
+      - name: Start web app
+        run: |
+          nohup python3 -m http.server 8080 > /tmp/web.log 2>&1 &
+          sleep 2
+          curl -s http://localhost:8080 | head -3
+
+      - name: Create tunnel
+        run: |
+          npm install -g localtunnel 2>/dev/null || true
+          if command -v lt >/dev/null 2>&1; then
+            nohup lt --port 8080 > /tmp/tunnel.log 2>&1 &
+            sleep 5
+            TUN=$(grep -oE 'https://[a-z0-9-]+\.loca\.lt' /tmp/tunnel.log | head -1)
+            if [ -n "$TUN" ]; then
+              echo "TUNNEL_URL::$TUN" >> "$GITHUB_ENV"
+              echo "Tunnel: $TUN"
+            fi
+          fi
+
+      - name: Show info
+        run: |
+          echo "Local: http://localhost:8080"
+          if [ -n "${TUNNEL_URL:-}" ]; then echo "Public: $TUNNEL_URL"; fi
+          echo "⏱ Max duration: 1440 min (24 hours)"
+
+      - name: Keep alive
+        run: |
+          for i in $(seq 1 1440); do
+            if ! pgrep -f "python3 -m http.server 8080" >/dev/null 2>&1; then
+              nohup python3 -m http.server 8080 > /tmp/web2.log 2>&1 &
+            fi
+            sleep 30
+          done
