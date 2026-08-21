@@ -25,41 +25,58 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y openssh-server jq
 
-      - name: Create privilege separation directory
+      - name: Create privilege separation directories
         run: |
+          # Create both possible privilege separation dirs
           sudo mkdir -p /run/sshd
+          sudo mkdir -p /var/run/sshd
+          sudo mkdir -p /var/empty/sshd
 
-      - name: Start SSH server
+      - name: Start SSH server (Robust method)
         run: |
-          sudo /usr/sbin/sshd
+          # Method 1: Standard start
+          sudo /usr/sbin/sshd || true
+          sleep 1
+          
+          # Method 2: Check if running, if not try with -D flag
+          if ! pgrep -x sshd > /dev/null; then
+            echo "sshd not running with standard method, trying fallback..."
+            sudo /usr/sbin/sshd -D &
+            sleep 3
+          fi
+          
+          # Method 3: Final check and force start
+          if ! pgrep -x sshd > /dev/null; then
+            echo "Attempting forceful sshd start..."
+            # Kill any existing sshd
+            sudo pkill -9 sshd 2>/dev/null || true
+            sleep 1
+            # Start sshd in foreground/background
+            sudo /usr/sbin/sshd -D &
+            sleep 3
+          fi
+          
           # Verify sshd is running
           if pgrep -x sshd > /dev/null; then
-            echo "sshd is running"
+            echo "✅ sshd is running"
           else
-            echo "WARNING: sshd could not start"
-            sudo mkdir -p /var/run/sshd
-            sudo /usr/sbin/sshd -D &
-            sleep 2
-            if pgrep -x sshd > /dev/null; then
-              echo "sshd started with fallback method"
-            fi
+            echo "⚠️  sshd could not start - checking logs"
+            cat /var/log/auth.log 2>/dev/null | tail -20 || echo "No auth.log available"
           fi
-          sleep 2
 
       - name: Create temporary SSH user
         run: |
           sudo useradd -m -s /bin/bash tmpuser
-          # Set temporary password (expires after first use)
+          # Set temporary password
           echo "tmpuser:RunnerTunnel2024!" | sudo chpasswd
           # Ensure user can SSH in
           echo "tmpuser ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/tmpuser
           # Unlock the account
           sudo passwd -u tmpuser
-          echo "Temporary SSH user 'tmpuser' created"
+          echo "✅ Temporary SSH user 'tmpuser' created"
 
       - name: Get runner network information
         run: |
-          # Get the runner's internal IP and details
           IP_ADDR=$(hostname -I | awk '{print $1}')
           echo "Runner IP: $IP_ADDR"
           echo "RUNNER_IP::$IP_ADDR" >> "$GITHUB_ENV"
@@ -80,27 +97,25 @@ jobs:
           echo "Username: tmpuser"
           echo ""
           if [ -n "${RUNNER_IP:-}" ]; then
-            # Try direct IP first
-            echo "  Direct SSH attempt:"
+            echo "  Runner Internal IP: ${RUNNER_IP}"
+            echo ""
+            echo "  SSH COMMAND TO RUN:"
             echo "  ssh -o StrictHostKeyChecking=no tmpuser@${RUNNER_IP}"
             echo ""
             echo "  PASSWORD: RunnerTunnel2024!"
             echo ""
-            echo "  Note: This may work if your network can reach"
-            echo "  GitHub's runner infrastructure, or if you're"
-            echo "  on the same network as the runner."
-            echo ""
-            echo "  Alternative: Use a tunneling service (ngrok,"
-            echo "  cloudflared) for remote access."
+            echo "  Note: This connects to GitHub's internal network."
+            echo "  If connection fails, try re-running the workflow."
+            echo "  ⚠️  This runner is TEMPORARY - terminates when"
+            echo "  workflow is cancelled"
           else
             echo "  Unable to determine runner IP."
             echo "  Try: ssh -o StrictHostKeyChecking=no tmpuser@localhost"
           fi
           echo ""
-          echo "  ⚠️  This runner is TEMPORARY - terminates when"
-          echo "  workflow is cancelled"
-          echo "  ⚠️  Workflow can be cancelled anytime from"
-          echo "  GitHub → Actions tab"
+          echo "  ⚠️  This runner is TEMPORARY"
+          echo "  ⚠️  Workflow can be cancelled anytime"
+          echo "  ⚠️  SSH access ends when workflow cancels"
           echo "========================================="
           echo ""
           echo "  To cancel this workflow:"
@@ -119,8 +134,9 @@ jobs:
             # Check and restart sshd if needed
             if ! pgrep -x sshd > /dev/null 2>&1; then
               echo "[$(date)] sshd not running, restarting..."
-              sudo /usr/sbin/sshd
-              sleep 2
+              sudo mkdir -p /run/sshd /var/run/sshd
+              sudo /usr/sbin/sshd -D &
+              sleep 3
             fi
             
             # Print status every 3 cycles
