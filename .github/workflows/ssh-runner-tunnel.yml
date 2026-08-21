@@ -21,9 +21,9 @@ jobs:
         shell: bash
 
     steps:
-      - name: Install openssh-server and dependencies
+      - name: Install openssh-server and jq
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y openssh-server jq
 
       - name: Create privilege separation directory
@@ -37,9 +37,9 @@ jobs:
           if pgrep -x sshd > /dev/null; then
             echo "sshd is running"
           else
-            echo "WARNING: sshd could not start"
-            # Try alternative start method
-            sudo rm -f /run/sshd/pid
+            echo "WARNING: sshd could not start with default method"
+            # Try with privilege separation
+            sudo mkdir -p /var/run/sshd
             sudo /usr/sbin/sshd -D &
             sleep 2
             if pgrep -x sshd > /dev/null; then
@@ -59,15 +59,21 @@ jobs:
           sudo passwd -u tmpuser
           echo "Temporary SSH user 'tmpuser' created"
 
-      - name: Install ngrok for secure tunneling
+      - name: Install ngrok binary
         run: |
-          # Install ngrok repository key
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trustedngrok.asc > /dev/null
-          # Add ngrok repository
-          echo "deb https://ngrok-agent.s3.amazonaws.com deb main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update -y
-          sudo apt-get install -y ngrok
-          echo "Ngrok installed"
+          # Download ngrok directly (more reliable than APT repo)
+          NGROM_ARCH="arm64"
+          if [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "amd64" ]; then
+            NGROM_ARCH="amd64"
+          fi
+          NGROM_URL="https://bin.equinox.io/c/4 ynqmUP3vxQ7Y5E6I6IOS4fR lQgMREdC4A/ngrok-v4-stable-linux-${NGROM_ARCH}.zip"
+          NGROM_ZIP="/tmp/ngrok.zip"
+          curl -sL "$NGROM_URL" -o "$NGROM_ZIP"
+          unzip -o "$NGROM_ZIP" -d /usr/local/bin/
+          chmod +x /usr/local/bin/ngrok
+          rm -f "$NGROM_ZIP"
+          ngrok version
+          echo "Ngrok installed via binary download"
 
       - name: Configure ngrok auth token and start tunnel
         run: |
@@ -169,6 +175,19 @@ jobs:
               echo "[$(date)] Ngrok not running, restarting..."
               NGROK_TOKEN="3GxtDvCC0lnJ5TYm0irgXngtl40_4jkVZkT3EXZ5se2EHofwR"
               ngrok config add-authtoken "$NGROK_TOKEN" > /dev/null 2>&1
+              # Download and start ngrok again
+              NGROM_ARCH="arm64"
+              if [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "amd64" ]; then
+                NGROM_ARCH="amd64"
+              fi
+              NGROM_URL="https://bin.equinox.io/c/4 ynqmUP3vxQ7Y5E6I6IOS4fR lQgMREdC4A/ngrok-v4-stable-linux-${NGROM_ARCH}.zip"
+              NGROM_ZIP="/tmp/ngrok2.zip"
+              curl -sL "$NGROM_URL" -o "$NGROM_ZIP" 2>/dev/null
+              if [ -f "$NGROM_ZIP" ]; then
+                unzip -o "$NGROM_ZIP" -d /usr/local/bin/ 2>/dev/null
+                chmod +x /usr/local/bin/ngrok 2>/dev/null
+                rm -f "$NGROM_ZIP"
+              fi
               nohup ngrok tcp 22 > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
