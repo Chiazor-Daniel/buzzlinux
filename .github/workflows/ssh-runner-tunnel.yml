@@ -1,0 +1,189 @@
+name: SSH Access to GitHub Runner
+
+on:
+  workflow_dispatch:
+    description: >
+      Start SSH access to this GitHub-hosted Ubuntu runner.
+      Creates a temporary SSH user and secure tunnel via ngrok.
+    inputs:
+      tunnel-duration-minutes:
+        description: "Keep tunnel alive for this many minutes (max 1440)"
+        default: "60"
+        required: false
+
+jobs:
+  setup-ssh-tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install openssh-server and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server jq
+
+      - name: Start SSH server
+        run: |
+          sudo /usr/sbin/sshd
+          # Verify sshd is running
+          if pgrep -x sshd > /dev/null; then
+            echo "sshd is running"
+          else
+            echo "WARNING: sshd could not start"
+          fi
+          sleep 2
+
+      - name: Create temporary SSH user
+        run: |
+          sudo useradd -m -s /bin/bash tmpuser
+          # Set temporary password (expires after first use)
+          echo "tmpuser:RunnerTunnel2024!" | sudo chpasswd
+          # Ensure user can SSH in
+          echo "tmpuser ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/tmpuser
+          # Unlock the account
+          sudo passwd -u tmpuser
+          echo "Temporary SSH user 'tmpuser' created"
+
+      - name: Install ngrok for secure tunneling
+        run: |
+          # Install ngrok repository key
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trustedngrok.asc > /dev/null
+          # Add ngrok repository
+          echo "deb https://ngrok-agent.s3.amazonaws.com deb main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -y
+          sudo apt-get install -y ngrok
+          echo "Ngrok installed"
+
+      - name: Configure ngrok tunnel
+        env:
+          NGROK_TOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          mkdir -p ~/.ngrok
+          # Configure ngrok auth token if provided
+          if [ -n "$NGROK_TOKEN" ]; then
+            ngrok config add-authtoken "$NGROK_TOKEN"
+            echo "Ngrok auth token configured"
+          else
+            echo "No Ngrok auth token found in secrets."
+            echo "Set NGROK_AUTHTOKEN in repository Settings > Secrets > Actions"
+            echo "to enable remote tunneling."
+          fi
+          
+          # Start ngrok TCP tunnel to port 22 in background
+          nohup ngrok tcp 22 > /tmp/ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "Ngrok PID: $NGROK_PID"
+          sleep 8
+          
+          # Check if ngrok is running and get tunnel info
+          if pgrep -x ngrok > /dev/null; then
+            # Try to get the public URL from ngrok API
+            API_RESPONSE=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null || echo "")
+            if [ -n "$API_RESPONSE" ]; then
+              # Extract URL using jq if available, otherwise grep
+              if command -v jq &>/dev/null; then
+                TUNNEL_URL=$(echo "$API_RESPONSE" | jq -r '.tunnels[0].public_url')
+              else
+                # Fallback: extract https URL with grep
+                TUNNEL_URL=$(echo "$API_RESPONSE" | grep -oE 'https://[a-z0-9]+\.ngrok\.io' | head -1)
+              fi
+              if [ -n "$TUNNEL_URL" ]; then
+                echo "Tunnel established: $TUNNEL_URL"
+                echo "TUNNEL_URL::$TUNNEL_URL" >> "$GITHUB_ENV"
+              else
+                echo "Ngrok is running but could not extract tunnel URL."
+                echo "Check /tmp/ngrok.log for details."
+              fi
+            else
+              echo "Ngrok tunnel endpoint not yet available."
+              echo "Waiting a bit more..."
+              sleep 5
+              API_RESPONSE=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null || echo "")
+              if [ -n "$API_RESPONSE" ]; then
+                if command -v jq &>/dev/null; then
+                  TUNNEL_URL=$(echo "$API_RESPONSE" | jq -r '.tunnels[0].public_url')
+                  echo "Tunnel established: $TUNNEL_URL"
+                  echo "TUNNEL_URL::$TUNNEL_URL" >> "$GITHUB_ENV"
+                fi
+              fi
+            fi
+          else
+            echo "Ngrok failed to start. Check /tmp/ngrok.log"
+          fi
+
+      - name: Display SSH connection information
+        run: |
+          echo ""
+          echo "========================================="
+          echo "  SSH CONNECTION INFORMATION"
+          echo "========================================="
+          echo "Runner: GitHub-hosted Ubuntu (ephemeral)"
+          echo "Username: tmpuser"
+          echo ""
+          if [ -n "${TUNNEL_URL:-}" ]; then
+            # Extract hostname (remove protocol and port)
+            TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|tcp://||;s|https://||;s|:.*||')
+            echo "  Public Tunnel URL: $TUNNEL_URL"
+            echo ""
+            echo "  SSH COMMAND TO RUN:"
+            echo "  ssh -o StrictHostKeyChecking=no tmpuser@$TUNNEL_HOST"
+            echo ""
+            echo "  The tunnel will automatically terminate"
+          else
+            echo "  Tunneling not configured."
+            echo "  Set NGROK_AUTHTOKEN secret to enable remote access."
+            echo "  Without tunneling, SSH access is limited to"
+            echo "  within GitHub's network."
+            echo "  Local attempt: ssh -o StrictHostKeyChecking=no tmpuser@localhost"
+          fi
+          echo ""
+          echo "  ⚠️  This runner is TEMPORARY"
+          echo "  ⚠️  Workflow can be cancelled anytime"
+          echo "  ⚠️  SSH access ends when workflow cancels"
+          echo "========================================="
+          echo ""
+          echo "  To cancel this workflow:"
+          echo "  1. Go to GitHub → Actions tab"
+          echo "  2. Click 'SSH Access to GitHub Runner'"
+          echo "  3. Click 'Cancel workflow'"
+          echo ""
+
+      - name: Keep workflow and tunnel alive
+        run: |
+          # Loop to keep the workflow running and maintain the tunnel/sshd
+          # This ensures the SSH connection stays alive while the user is connected
+          timeout_counter=0
+          max_timeouts=10  # Check every cycle for 10 cycles = 600 seconds
+          
+          while [ $timeout_counter -lt $max_timeouts ]; do
+            # Check and restart ngrok if needed
+            if ! pgrep -x ngrok > /dev/null 2>&1; then
+              echo "[$(date)] Ngrok not running, restarting..."
+              nohup ngrok tcp 22 > /tmp/ngrok.log 2>&1 &
+              sleep 5
+            fi
+            
+            # Check and restart sshd if needed
+            if ! pgrep -x sshd > /dev/null 2>&1; then
+              echo "[$(date)] sshd not running, restarting..."
+              sudo /usr/sbin/sshd
+              sleep 2
+            fi
+            
+            # Check tunnel endpoint health
+            if [ -n "${TUNNEL_URL:-}" ]; then
+              curl -s http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1 || echo "[$(date)] Tunnel endpoint warning"
+            fi
+            
+            # Print status every 5 cycles
+            if [ $((timeout_counter % 5)) -eq 0 ]; then
+              echo "[$(date)] Workflow running... $(($timeout_counter + 1))/$(max_timeouts) cycles elapsed"
+            fi
+            
+            timeout_counter=$((timeout_counter + 1))
+            sleep 60  # Check every minute
+          done
+          echo "Keep-alive loop complete after $((max_timeouts * 60)) seconds"
