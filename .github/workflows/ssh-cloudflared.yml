@@ -1,0 +1,177 @@
+name: SSH Access via Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+    description: >
+      Start SSH access to this GitHub-hosted Ubuntu runner.
+      Uses cloudflared for lightweight tunnel (no large ngrok binaries).
+    inputs:
+      tunnel-duration-minutes:
+        description: "Keep tunnel alive for this many minutes (max 1440)"
+        default: "60"
+        required: false
+
+jobs:
+  setup-ssh-tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install openssh-server and cloudflared
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server cloudflared jq
+
+      - name: Create privilege separation directory
+        run: |
+          sudo mkdir -p /run/sshd
+
+      - name: Start SSH server
+        run: |
+          sudo /usr/sbin/sshd
+          # Verify sshd is running
+          if pgrep -x sshd > /dev/null; then
+            echo "sshd is running"
+          else
+            echo "WARNING: sshd could not start with default method"
+            # Try with privilege separation
+            sudo mkdir -p /var/run/sshd
+            sudo /usr/sbin/sshd -D &
+            sleep 2
+            if pgrep -x sshd > /dev/null; then
+              echo "sshd started with -D flag"
+            fi
+          fi
+          sleep 2
+
+      - name: Create temporary SSH user
+        run: |
+          sudo useradd -m -s /bin/bash tmpuser
+          # Set temporary password (expires after first use)
+          echo "tmpuser:RunnerTunnel2024!" | sudo chpasswd
+          # Ensure user can SSH in
+          echo "tmpuser ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/tmpuser
+          # Unlock the account
+          sudo passwd -u tmpuser
+          echo "Temporary SSH user 'tmpuser' created"
+
+      - name: Setup Cloudflare Tunnel
+        run: |
+          # Start cloudflared tunnel to port 22 in background
+          # This creates a public HTTPS URL mapping to local SSH
+          nohup cloudflared tunnel --url http://localhost:22 > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo "cloudflared PID: $CF_PID"
+          sleep 10
+          
+          # Check if cloudflared is running and get tunnel info
+          if pgrep -x cloudflared > /dev/null; then
+            # Read the tunnel status from the log/output
+            # cloudflared typically outputs the public URL to stderr/stdout
+            CLOUDFLARDED_RESPONSE=$(curl -s http://127.0.0.1:5000/status 2>/dev/null || echo "")
+            # Alternative: check the log file for the URL
+            if [ -f /tmp/cloudflared.log ]; then
+              CLOUD_URL=$(grep -oE 'https://[a-z0-9]+\.trycloudflare.com' /tmp/cloudflared.log | head -1)
+            else
+              CLOUD_URL=""
+            fi
+            
+            # If not in log, try API
+            if [ -z "$CLOUD_URL" ]; then
+              CLOUD_URL=$(curl -s http://127.0.0.1:5000/api/tunnels 2>/dev/null | jq -r '.tunnels[0].public_url' 2>/dev/null || echo "")
+            fi
+            
+            if [ -n "$CLOUD_URL" ]; then
+              echo "Cloudflare Tunnel established: $CLOUD_URL"
+              echo "CLOUD_URL::$CLOUD_URL" >> "$GITHUB_ENV"
+              echo "TUNNEL_PROTOCOL::https" >> "$GITHUB_ENV"
+            else
+              echo "cloudflared is running but could not extract tunnel URL."
+              echo "Check /tmp/cloudflared.log for details."
+              # Try reading the final line from log
+              LAST_LOG=$(tail -20 /tmp/cloudflared.log 2>/dev/null | grep -oE 'https://[a-z0-9]+\.trycloudflare.com' | head -1)
+              if [ -n "$LAST_LOG" ]; then
+                CLOUD_URL=$LAST_LOG
+                echo "Cloudflare Tunnel established (from log): $CLOUD_URL"
+                echo "CLOUD_URL::$CLOUD_URL" >> "$GITHUB_ENV"
+              fi
+            fi
+          else
+            echo "cloudflared failed to start. Check /tmp/cloudflared.log for details."
+          fi
+
+      - name: Display SSH connection information
+        run: |
+          echo ""
+          echo "========================================="
+          echo "  SSH CONNECTION INFORMATION"
+          echo "========================================="
+          echo "Runner: GitHub-hosted Ubuntu (ephemeral)"
+          echo "Username: tmpuser"
+          echo ""
+          if [ -n "${CLOUD_URL:-}" ]; then
+            echo "  Public Tunnel URL: $CLOUD_URL"
+            echo ""
+            echo "  SSH COMMAND TO RUN:"
+            echo "  ssh -o StrictHostKeyChecking=no tmpuser@$CLOUD_URL"
+            echo ""
+            echo "  PASSWORD: RunnerTunnel2024!"
+            echo ""
+            echo "  The tunnel will automatically terminate"
+          else
+            echo "  Tunneling not configured."
+            echo "  Check /tmp/cloudflared.log for details."
+            echo "  Local attempt: ssh -o StrictHostKeyChecking=no tmpuser@localhost"
+          fi
+          echo ""
+          echo "  ⚠️  This runner is TEMPORARY"
+          echo "  ⚠️  Workflow can be cancelled anytime"
+          echo "  ⚠️  SSH access ends when workflow cancels"
+          echo "========================================="
+          echo ""
+          echo "  To cancel this workflow:"
+          echo "  1. Go to GitHub → Actions tab"
+          echo "  2. Click 'SSH Access via Cloudflare Tunnel'"
+          echo "  3. Click 'Cancel workflow'"
+          echo ""
+
+      - name: Keep workflow and tunnel alive
+        run: |
+          # Loop to keep the workflow running and maintain the tunnel/sshd
+          timeout_counter=0
+          max_timeouts=12  # Check every cycle for 12 cycles = 720 seconds (12 minutes)
+          
+          while [ $timeout_counter -lt $max_timeouts ]; do
+            # Check and restart cloudflared if needed
+            if ! pgrep -x cloudflared > /dev/null 2>&1; then
+              echo "[$(date)] cloudflared not running, restarting..."
+              nohup cloudflared tunnel --url http://localhost:22 > /tmp/cloudflared.log 2>&1 &
+              CF_PID=$!
+              sleep 10
+            fi
+            
+            # Check and restart sshd if needed
+            if ! pgrep -x sshd > /dev/null 2>&1; then
+              echo "[$(date)] sshd not running, restarting..."
+              sudo mkdir -p /run/sshd
+              sudo /usr/sbin/sshd
+              sleep 2
+            fi
+            
+            # Check tunnel endpoint health
+            if [ -n "${CLOUD_URL:-}" ]; then
+              curl -s http://127.0.0.1:5000/status > /dev/null 2>&1 || echo "[$(date)] Tunnel endpoint warning"
+            fi
+            
+            # Print status every 3 cycles
+            if [ $((timeout_counter % 3)) -eq 0 ]; then
+              echo "[$(date)] Workflow running... $(($timeout_counter + 1))/$(max_timeouts) cycles elapsed ($((timeout_counter + 1)) minutes)"
+            fi
+            
+            timeout_counter=$((timeout_counter + 1))
+            sleep 60  # Check every minute
+          done
+          echo "Keep-alive loop complete after $((max_timeouts * 60)) seconds"
