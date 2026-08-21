@@ -5,6 +5,7 @@ on:
     description: >
       Start SSH access to this GitHub-hosted Ubuntu runner.
       Creates a temporary SSH user and secure tunnel via ngrok.
+      Uses embedded ngrok auth token for immediate setup.
     inputs:
       tunnel-duration-minutes:
         description: "Keep tunnel alive for this many minutes (max 1440)"
@@ -57,30 +58,23 @@ jobs:
           sudo apt-get install -y ngrok
           echo "Ngrok installed"
 
-      - name: Configure ngrok tunnel
-        env:
-          NGROK_TOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      - name: Configure ngrok auth token and start tunnel
         run: |
+          # Set ngrok auth token (embedded - no secret needed)
+          NGROK_TOKEN="3GxtDvCC0lnJ5TYm0irgXngtl40_4jkVZkT3EXZ5se2EHofwR"
           mkdir -p ~/.ngrok
-          # Configure ngrok auth token if provided
-          if [ -n "$NGROK_TOKEN" ]; then
-            ngrok config add-authtoken "$NGROK_TOKEN"
-            echo "Ngrok auth token configured"
-          else
-            echo "No Ngrok auth token found in secrets."
-            echo "Set NGROK_AUTHTOKEN in repository Settings > Secrets > Actions"
-            echo "to enable remote tunneling."
-          fi
+          ngrok config add-authtoken "$NGROK_TOKEN"
+          echo "Ngrok auth token configured"
           
           # Start ngrok TCP tunnel to port 22 in background
           nohup ngrok tcp 22 > /tmp/ngrok.log 2>&1 &
-          NGROK_PID=$!
-          echo "Ngrok PID: $NGROK_PID"
+          NGrok_PID=$!
+          echo "Ngrok PID: $NGrok_PID"
           sleep 8
           
           # Check if ngrok is running and get tunnel info
           if pgrep -x ngrok > /dev/null; then
-            # Try to get the public URL from ngrok API
+            # Get the public URL from ngrok API
             API_RESPONSE=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null || echo "")
             if [ -n "$API_RESPONSE" ]; then
               # Extract URL using jq if available, otherwise grep
@@ -111,7 +105,9 @@ jobs:
               fi
             fi
           else
-            echo "Ngrok failed to start. Check /tmp/ngrok.log"
+            echo "Ngrok failed to start. Check /tmp/ngrok.log for details."
+            echo "Log contents:"
+            cat /tmp/ngrok.log
           fi
 
       - name: Display SSH connection information
@@ -131,12 +127,12 @@ jobs:
             echo "  SSH COMMAND TO RUN:"
             echo "  ssh -o StrictHostKeyChecking=no tmpuser@$TUNNEL_HOST"
             echo ""
+            echo "  PASSWORD: RunnerTunnel2024!"
+            echo ""
             echo "  The tunnel will automatically terminate"
           else
             echo "  Tunneling not configured."
-            echo "  Set NGROK_AUTHTOKEN secret to enable remote access."
-            echo "  Without tunneling, SSH access is limited to"
-            echo "  within GitHub's network."
+            echo "  Check /tmp/ngrok.log for details."
             echo "  Local attempt: ssh -o StrictHostKeyChecking=no tmpuser@localhost"
           fi
           echo ""
@@ -156,12 +152,14 @@ jobs:
           # Loop to keep the workflow running and maintain the tunnel/sshd
           # This ensures the SSH connection stays alive while the user is connected
           timeout_counter=0
-          max_timeouts=10  # Check every cycle for 10 cycles = 600 seconds
+          max_timeouts=12  # Check every cycle for 12 cycles = 720 seconds (12 minutes)
           
           while [ $timeout_counter -lt $max_timeouts ]; do
             # Check and restart ngrok if needed
             if ! pgrep -x ngrok > /dev/null 2>&1; then
               echo "[$(date)] Ngrok not running, restarting..."
+              NGROK_TOKEN="3GxtDvCC0lnJ5TYm0irgXngtl40_4jkVZkT3EXZ5se2EHofwR"
+              ngrok config add-authtoken "$NGROK_TOKEN" > /dev/null 2>&1
               nohup ngrok tcp 22 > /tmp/ngrok.log 2>&1 &
               sleep 5
             fi
@@ -178,9 +176,9 @@ jobs:
               curl -s http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1 || echo "[$(date)] Tunnel endpoint warning"
             fi
             
-            # Print status every 5 cycles
-            if [ $((timeout_counter % 5)) -eq 0 ]; then
-              echo "[$(date)] Workflow running... $(($timeout_counter + 1))/$(max_timeouts) cycles elapsed"
+            # Print status every 3 cycles
+            if [ $((timeout_counter % 3)) -eq 0 ]; then
+              echo "[$(date)] Workflow running... $(($timeout_counter + 1))/$(max_timeouts) cycles elapsed ($((timeout_counter + 1)) minutes)"
             fi
             
             timeout_counter=$((timeout_counter + 1))
