@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     description: >
       Start SSH access to this GitHub-hosted Ubuntu runner.
-      Uses cloudflared for lightweight tunnel (no large ngrok binaries).
+      Uses cloudflared for lightweight tunnel.
     inputs:
       tunnel-duration-minutes:
         description: "Keep tunnel alive for this many minutes (max 1440)"
@@ -20,10 +20,10 @@ jobs:
         shell: bash
 
     steps:
-      - name: Install openssh-server and cloudflared
+      - name: Install openssh-server and jq
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y openssh-server cloudflared jq
+          sudo apt-get install -y openssh-server jq
 
       - name: Create privilege separation directory
         run: |
@@ -58,10 +58,34 @@ jobs:
           sudo passwd -u tmpuser
           echo "Temporary SSH user 'tmpuser' created"
 
+      - name: Install cloudflared binary
+        run: |
+          # Download cloudflared binary directly from Cloudflare
+          CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+          CLOUDFLARED_ZIP="/tmp/cloudflared.tar.gz"
+          # Try arm64 first (GitHub runners are often ARM), fall back to amd64
+          echo "Downloading cloudflared for architecture: $(uname -m)"
+          curl -sL "$CLOUDFLARED_URL" -o "$CLOUDFLARED_ZIP" 2>/dev/null || {
+            # Fallback to amd64 URL pattern
+            CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+            curl -sL "$CLOUDFLARED_URL" -o "$CLOUDFLARED_ZIP" 2>/dev/null || {
+              echo "Failed to download cloudflared binary"
+              exit 1
+            }
+          }
+          # Extract and install
+          if [[ "$CLOUDFLARED_ZIP" == *.tar.gz ]]; then
+            tar -xzf "$CLOUDFLARED_ZIP" -C /usr/local/bin/ cloudflared 2>/dev/null || true
+          else
+            chmod +x "$CLOUDFLARED_ZIP" && mv "$CLOUDFLARED_ZIP" /usr/local/bin/cloudflared
+          fi
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+          echo "cloudflared installed via binary download"
+
       - name: Setup Cloudflare Tunnel
         run: |
           # Start cloudflared tunnel to port 22 in background
-          # This creates a public HTTPS URL mapping to local SSH
           nohup cloudflared tunnel --url http://localhost:22 > /tmp/cloudflared.log 2>&1 &
           CF_PID=$!
           echo "cloudflared PID: $CF_PID"
@@ -69,18 +93,22 @@ jobs:
           
           # Check if cloudflared is running and get tunnel info
           if pgrep -x cloudflared > /dev/null; then
-            # Read the tunnel status from the log/output
-            # cloudflared typically outputs the public URL to stderr/stdout
-            CLOUDFLARDED_RESPONSE=$(curl -s http://127.0.0.1:5000/status 2>/dev/null || echo "")
-            # Alternative: check the log file for the URL
+            # Read the tunnel status from the log
             if [ -f /tmp/cloudflared.log ]; then
               CLOUD_URL=$(grep -oE 'https://[a-z0-9]+\.trycloudflare.com' /tmp/cloudflared.log | head -1)
             else
               CLOUD_URL=""
             fi
             
-            # If not in log, try API
+            # If not in log, try reading from the tunnel info
             if [ -z "$CLOUD_URL" ]; then
+              # cloudflared typically writes the URL to stdout, capture it
+              CLOUD_URL=$(nohup cloudflared tunnel --url http://localhost:22 2>/dev/null | grep -oE 'https://[a-z0-9]+\.trycloudflare.com' | head -1)
+            fi
+            
+            # Alternative: check the API if running
+            if [ -z "$CLOUD_URL" ]; then
+              sleep 3
               CLOUD_URL=$(curl -s http://127.0.0.1:5000/api/tunnels 2>/dev/null | jq -r '.tunnels[0].public_url' 2>/dev/null || echo "")
             fi
             
@@ -91,16 +119,18 @@ jobs:
             else
               echo "cloudflared is running but could not extract tunnel URL."
               echo "Check /tmp/cloudflared.log for details."
-              # Try reading the final line from log
-              LAST_LOG=$(tail -20 /tmp/cloudflared.log 2>/dev/null | grep -oE 'https://[a-z0-9]+\.trycloudflare.com' | head -1)
-              if [ -n "$LAST_LOG" ]; then
-                CLOUD_URL=$LAST_LOG
-                echo "Cloudflare Tunnel established (from log): $CLOUD_URL"
-                echo "CLOUD_URL::$CLOUD_URL" >> "$GITHUB_ENV"
+              # Try one more time reading the log
+              if [ -f /tmp/cloudflared.log ]; then
+                CLOUD_URL=$(tail -30 /tmp/cloudflared.log | grep -oE 'https://[a-z0-9]+\.trycloudflare.com' | head -1)
+                if [ -n "$CLOUD_URL" ]; then
+                  echo "Cloudflare Tunnel established (from log): $CLOUD_URL"
+                  echo "CLOUD_URL::$CLOUD_URL" >> "$GITHUB_ENV"
+                fi
               fi
             fi
           else
             echo "cloudflared failed to start. Check /tmp/cloudflared.log for details."
+            cat /tmp/cloudflared.log
           fi
 
       - name: Display SSH connection information
@@ -148,8 +178,21 @@ jobs:
             # Check and restart cloudflared if needed
             if ! pgrep -x cloudflared > /dev/null 2>&1; then
               echo "[$(date)] cloudflared not running, restarting..."
+              # Download and start cloudflared again
+              CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+              CLOUDFLARED_ZIP="/tmp/cloudflared2.tar.gz"
+              echo "Downloading cloudflared again for architecture: $(uname -m)"
+              curl -sL "$CLOUDFLARED_URL" -o "$CLOUDFLARED_ZIP" 2>/dev/null || {
+                CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+                curl -sL "$CLOUDFLARED_URL" -o "$CLOUDFLARED_ZIP" 2>/dev/null || true
+              }
+              if [[ "$CLOUDFLARED_ZIP" == *.tar.gz ]]; then
+                tar -xzf "$CLOUDFLARED_ZIP" -C /usr/local/bin/ cloudflared 2>/dev/null || true
+              else
+                chmod +x "$CLOUDFLARED_ZIP" && mv "$CLOUDFLARED_ZIP" /usr/local/bin/cloudflared
+              fi
+              chmod +x /usr/local/bin/cloudflared
               nohup cloudflared tunnel --url http://localhost:22 > /tmp/cloudflared.log 2>&1 &
-              CF_PID=$!
               sleep 10
             fi
             
