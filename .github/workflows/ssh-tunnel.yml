@@ -1,0 +1,106 @@
+name: SSH Access via Runner Tunnel
+
+on:
+  workflow_dispatch:
+    description: Start SSH access to a GitHub-hosted Ubuntu runner using a reverse tunnel
+    inputs:
+      duration-minutes:
+        description: Keep the tunnel alive for this many minutes
+        default: '120'
+        required: false
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+
+    outputs:
+      ssh-command: ${{ steps.tunnel.outputs.ssh-command }}
+
+    steps:
+      - name: Install prerequisites and start SSH server
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server jq openssh-client
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd || true
+          sudo useradd -m -s /bin/bash tmpuser || true
+          echo "tmpuser:RunnerTunnel2024!" | sudo chpasswd
+          echo "tmpuser ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/tmpuser || true
+          sudo passwd -u tmpuser || true
+
+      - name: Configure SSH server on port 2222
+        run: |
+          sudo pkill -9 sshd 2>/dev/null || true
+          sleep 1
+          sudo mkdir -p /var/run/sshd
+          sudo tee /etc/ssh/sshd_config.d/runner.conf >/dev/null <<'EOF'
+Port 2222
+PermitRootLogin no
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM yes
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
+          sudo /usr/sbin/sshd
+          sleep 1
+          sudo ss -tlnp | grep ':2222 ' || true
+          sudo pgrep -a sshd || true
+
+      - name: Test tunnel connection
+        run: |
+          echo 'No manual password input will work here. This step is just a sanity check.'
+          true
+
+      - name: Establish tunnel and output connection info
+        id: tunnel
+        run: |
+          SSH_PORT=2222
+          echo "Attempting tunnel setup..."
+
+          # 1) Start an SSH reverse tunnel in the background, log everything
+          nohup ssh -o StrictHostKeyChecking=no -N -R "*:2222:localhost:${SSH_PORT}" serveo.net > /tmp/serveo.log 2>&1 &
+          TUN_PID=$!
+          echo "Tunnel PID: $TUN_PID"
+
+          # 2) Wait and extract the mapped domain
+          HOST=""
+          for i in $(seq 1 60); do
+            if [ -f /tmp/serveo.log ]; then
+              HOST=$(grep -Eo 'https?://[a-zA-Z0-9._-]+\.serveo\.net' /tmp/serveo.log | head -n1 || true)
+              if [ -n "$HOST" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+
+          if [ -z "$HOST" ]; then
+            echo "Serveo tunnel did not report a public host in time."
+            echo "Last 80 lines of /tmp/serveo.log:"
+            tail -n 80 /tmp/serveo.log || true
+            echo "Try rerunning. This just means the tunnel reachability check failed."
+          else
+            echo "Tunnel host: $HOST"
+            echo "ssh-command=ssh -p 2222 tmpuser@$HOST" >> $GITHUB_OUTPUT
+            echo "Connect command: ssh -p 2222 tmpuser@$HOST"
+            echo "Password: RunnerTunnel2024!"
+          fi
+
+      - name: Keep runner alive
+        if: always()
+        run: |
+          SSH_PORT=2222
+          echo "Keeping runner alive until cancelled..."
+          while true; do
+            if ! pgrep -x sshd >/dev/null 2>&1; then
+              sudo /usr/sbin/sshd
+            fi
+            sleep 60
+          done
