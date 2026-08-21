@@ -1,4 +1,4 @@
-name: Web App with Tunnel
+name: Web App with Temporary Tunnel
 
 on:
   workflow_dispatch:
@@ -6,66 +6,84 @@ on:
 jobs:
   web:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
 
     steps:
-      - name: Show runner info
+      - name: Change to runner-web directory
         run: |
-          echo "Runner: $(hostname)"
-          echo "OS: Ubuntu 24.04.4 LTS"
-          echo "IP: $(hostname -I | awk '{print $1}')"
+          cd runner-web || true
 
-      - name: Start simple web app
+      - name: Start web app (best effort)
         run: |
-          nohup python3 runner-web/app.py > /tmp/web.log 2>&1 &
-          echo "Web app PID: $!"
-          sleep 2
-          curl -s http://localhost:8080 | head -5
+          # Start Python web app in background; don't fail workflow if it has issues
+          nohup python3 app.py > /tmp/web.log 2>&1 &
+          WEB_PID=$!
+          echo "Web app PID: $WEB_PID"
+          # Wait briefly and check if it's running
+          sleep 3
+          if curl -s http://localhost:8080 > /dev/null 2>&1; then
+            echo "Web app is running on port 8080"
+          else
+            echo "Web app may not be running yet (checking log...)"
+            cat /tmp/web.log 2>/dev/null || echo "No log file"
+          fi
+          # Don't let exit code 7 or other issues stop the workflow
+          true
 
       - name: Try Cloudflare Tunnel (cloudflared)
         run: |
-          echo "Attempting cloudflared tunnel..."
-
-          curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz" -o /tmp/cloudflared.tgz || true
-
+          echo "Attempting cloudflared tunnel setup..."
+          
+          # Download cloudflared for amd64
+          curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz" -o /tmp/cloudflared.tgz 2>/dev/null || true
+          
           if [ -f /tmp/cloudflared.tgz ] && [ -s /tmp/cloudflared.tgz ]; then
-            echo "Downloaded cloudflared binary"
-            tar -xzf /tmp/cloudflared.tgz -C /tmp cloudflared 2>/dev/null && cp /tmp/cloudflared /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared && echo "extracted to /usr/local/bin"
+            echo "Extracting cloudflared..."
+            tar -xzf /tmp/cloudflared.tgz -C /tmp cloudflared 2>/dev/null && cp /tmp/cloudflared /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared && echo "cloudflared installed" || true
           else
-            echo "cloudflared download failed, trying npm localtunnel..."
-            npm install -g localtunnel 2>/dev/null || true
+            echo "cloudflared binary download failed"
           fi
-
+          
+          # Try to start cloudflared if available
           if command -v cloudflared >/dev/null 2>&1; then
             echo "Starting cloudflared tunnel..."
+            # Tunnel to localhost:8080; -url flag creates a temporary public URL
             nohup cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel.log 2>&1 &
-            sleep 10
-            TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+            TUN_PID=$!
+            echo "cloudflared PID: $TUN_PID"
+            sleep 15
+            
+            # Extract the public URL from the log
+            TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -n1)
             if [ -n "$TUNNEL_URL" ]; then
               echo "TUNNEL_URL::$TUNNEL_URL" >> $GITHUB_ENV
-              echo "Cloudflare Tunnel: $TUNNEL_URL"
+              echo "✅ Cloudflare Tunnel established: $TUNNEL_URL"
+              echo "🌐 Open: $TUNNEL_URL"
             else
-              echo "cloudflared started but URL not found"
-              tail -20 /tmp/tunnel.log
-            fi
-          elif command -v lt >/dev/null 2>&1; then
-            echo "Starting localtunnel..."
-            nohup lt --port 8080 > /tmp/tunnel.log 2>&1 &
-            sleep 10
-            TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.loca\.lt' /tmp/tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "TUNNEL_URL::$TUNNEL_URL" >> $GITHUB_ENV
-              echo "Localtunnel: $TUNNEL_URL"
-            else
-              echo "localtunnel started but URL not found"
-              tail -20 /tmp/tunnel.log
+              echo "cloudflared started but URL not found in logs"
+              echo "📝 Last 20 lines of tunnel log:"
+              tail -n 20 /tmp/tunnel.log
             fi
           else
-            echo "TUNNEL_URL::" >> $GITHUB_ENV
-            echo "No tunneling method available"
+            echo "cloudflared not available - trying localtunnel..."
+            npm install -g localtunnel 2>/dev/null || true
+            if command -v lt >/dev/null 2>&1; then
+              nohup lt --port 8080 > /tmp/tunnel.log 2>&1 &
+              sleep 10
+              TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.loca\.lt' /tmp/tunnel.log | head -n1)
+              if [ -n "$TUNNEL_URL" ]; then
+                echo "TUNNEL_URL::$TUNNEL_URL" >> $GITHUB_ENV
+                echo "✅ Localtunnel established: $TUNNEL_URL"
+              else
+                echo "Localtunnel started but URL not found"
+                tail -10 /tmp/tunnel.log
+              fi
+            else
+              echo "Neither cloudflared nor localtunnel available"
+            fi
           fi
 
       - name: Display access information
@@ -75,30 +93,40 @@ jobs:
           echo "  WEB APP ACCESS INFORMATION"
           echo "========================================="
           echo ""
-          echo "  Local: http://localhost:8080"
+          echo "  Local (if running): http://localhost:8080"
           echo ""
           if [ -n "${TUNNEL_URL:-}" ]; then
-            echo "  Public Tunnel: $TUNNEL_URL"
+            echo "  🌐 Public Tunnel URL: $TUNNEL_URL"
             echo ""
-            echo "  Open in browser: $TUNNEL_URL"
+            echo "  Open this in your browser: $TUNNEL_URL"
           else
-            echo "  No public tunnel established."
-            echo "  Web app runs locally on the runner."
+            echo "  ⚠️  No public tunnel URL was generated."
+            echo "  The web app may not have started, or tunneling methods"
+            echo "  (cloudflared/localtunnel) are unavailable in this environment."
           fi
+          echo ""
+          echo "  Note: This is an ephemeral GitHub Actions runner."
+          echo "  The tunnel and web app disappear when the workflow ends."
+          echo "  Re-run for a fresh tunnel URL."
           echo ""
           echo "========================================="
           echo ""
-          echo "  Workflow stays alive up to 6 hours."
-          echo "  Cancel from GitHub Actions tab."
+          echo "  To cancel: GitHub → Actions tab → Cancel workflow"
           echo ""
 
-      - name: Keep running
+      - name: Keep workflow alive during connection
         run: |
-          echo "Keeping runner alive..."
-          while true; do
-            if ! pgrep -f "python3 runner-web/app.py" >/dev/null 2>&1; then
-              echo "Web app stopped, restarting..."
-              nohup python3 runner-web/app.py > /tmp/web.log 2>&1 &
+          echo "Workflow running - keep connected..."
+          # Loop to keep the workflow alive for up to 30 minutes
+          # (timeout-minutes is already set to 30 above)
+          for i in $(seq 1 30); do
+            if ! pgrep -f "python3 app.py" >/dev/null 2>&1; then
+              echo "[$(date)] Web app stopped, but workflow continues..."
             fi
-            sleep 30
+            # Print status every 5 minutes
+            if [ $((i % 5)) -eq 0 ]; then
+              echo "[$(date)] Workflow running... $(($i))/30 minutes elapsed"
+            fi
+            sleep 60
           done
+          echo "30-minute period complete"
