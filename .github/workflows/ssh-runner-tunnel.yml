@@ -26,6 +26,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server jq
 
+      - name: Create privilege separation directory
+        run: |
+          sudo mkdir -p /run/sshd
+
       - name: Start SSH server
         run: |
           sudo /usr/sbin/sshd
@@ -34,6 +38,13 @@ jobs:
             echo "sshd is running"
           else
             echo "WARNING: sshd could not start"
+            # Try alternative start method
+            sudo rm -f /run/sshd/pid
+            sudo /usr/sbin/sshd -D &
+            sleep 2
+            if pgrep -x sshd > /dev/null; then
+              echo "sshd started with -D flag"
+            fi
           fi
           sleep 2
 
@@ -106,8 +117,6 @@ jobs:
             fi
           else
             echo "Ngrok failed to start. Check /tmp/ngrok.log for details."
-            echo "Log contents:"
-            cat /tmp/ngrok.log
           fi
 
       - name: Display SSH connection information
@@ -167,6 +176,7 @@ jobs:
             # Check and restart sshd if needed
             if ! pgrep -x sshd > /dev/null 2>&1; then
               echo "[$(date)] sshd not running, restarting..."
+              sudo mkdir -p /run/sshd
               sudo /usr/sbin/sshd
               sleep 2
             fi
