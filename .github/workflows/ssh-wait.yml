@@ -1,0 +1,184 @@
+name: SSH Access - Wait for Connection
+
+on:
+  workflow_dispatch:
+    description: >
+      Starts SSH server and KEEPS RUNNER ALIVE waiting for connection.
+      The workflow runs for up to 6 hours or until you cancel it.
+      Uses alternative port 2222 if port 22 is occupied.
+
+jobs:
+  setup-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # Maximum 6 hours
+    defaults:
+      run:
+        shell: bash
+
+    outputs:
+      ssh-port: ${{ steps.setup.outputs.ssh-port }}
+      runner-ip: ${{ steps.setup.outputs.runner-ip }}
+
+    steps:
+      - name: Check and fix port 22 situation
+        run: |
+          echo "Checking port 22 status..."
+          sudo ss -tlnp | grep :22 || echo "Nothing on port 22"
+          
+          # Check if any sshd is running
+          pgrep -a sshd || echo "No sshd running"
+          
+          # Kill any sshd process that might be conflicting
+          sudo pkill -9 sshd 2>/dev/null || true
+          sleep 2
+          
+          echo "Port 22 cleared of any SSH processes"
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server jq net-tools
+
+      - name: Create privilege separation directories
+        run: |
+          sudo mkdir -p /run/sshd
+          sudo mkdir -p /var/run/sshd
+          sudo mkdir -p /var/empty/sshd
+
+      - name: Start SSH server on port 2222
+        id: setup
+        run: |
+          SSH_PORT=2222
+          
+          # Create SSH config for alternative port
+          echo "Starting SSH server on port $SSH_PORT..."
+          
+          # Start sshd on alternative port
+          sudo /usr/sbin/sshd -p $SSH_PORT -o "ListenAddress=0.0.0.0" &
+          sleep 3
+          
+          # Verify sshd is running
+          if pgrep -x sshd > /dev/null; then
+            echo "✅ sshd is running on port $SSH_PORT"
+          else
+            echo "⚠️  Failed to start sshd, checking why..."
+            sudo /usr/sbin/sshd -p $SSH_PORT -o "ListenAddress=0.0.0.0" 2>&1 || true
+            sleep 2
+          fi
+          
+          # Verify port is listening
+          if sudo ss -tlnp | grep -q ":$SSH_PORT "; then
+            echo "✅ Port $SSH_PORT is LISTENING"
+          else
+            echo "⚠️  Port $SSH_PORT may not be listening"
+          fi
+          
+          # Get runner IP
+          IP_ADDR=$(hostname -I | awk '{print $1}')
+          
+          # Set outputs
+          echo "ssh-port=$SSH_PORT" >> $GITHUB_OUTPUT
+          echo "runner-ip=$IP_ADDR" >> $GITHUB_OUTPUT
+
+      - name: Create temporary SSH user
+        run: |
+          # Remove old user if exists and create fresh
+          sudo userdel -r tmpuser 2>/dev/null || true
+          sudo rm -rf /home/tmpuser
+          
+          # Create new user
+          sudo useradd -m -s /bin/bash tmpuser
+          echo "tmpuser:RunnerTunnel2024!" | sudo chpasswd
+          echo "tmpuser ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/tmpuser
+          sudo passwd -u tmpuser
+          echo "✅ Temporary SSH user 'tmpuser' created"
+
+      - name: Display connection information
+        run: |
+          IP="${{ steps.setup.outputs.runner-ip }}"
+          PORT="${{ steps.setup.outputs.ssh-port }}"
+          
+          echo ""
+          echo "========================================="
+          echo "  🖥️  SSH SERVER READY - WAITING FOR CONNECTION"
+          echo "========================================="
+          echo ""
+          echo "  Runner IP:  $IP"
+          echo "  SSH Port:   $PORT"
+          echo "  Username:   tmpuser"
+          echo "  Password:   RunnerTunnel2024!"
+          echo ""
+          echo "  🔗 CONNECT NOW:"
+          echo "  ssh -o StrictHostKeyChecking=no"
+          echo "     -p $PORT tmpuser@$IP"
+          echo ""
+          echo "  ⏰ This runner is waiting for you..."
+          echo "  ⚠️  Timeout: 6 hours max"
+          echo "========================================="
+          echo ""
+          echo "  To cancel:"
+          echo "  1. GitHub → Actions tab"
+          echo "  2. 'SSH Access - Wait for Connection'"
+          echo "  3. Cancel workflow"
+          echo ""
+
+      - name: 🔄 Keep SSH alive and WAIT for connection
+        run: |
+          SSH_PORT="${{ steps.setup.outputs.ssh-port }}"
+          IP="${{ steps.setup.outputs.runner-ip }}"
+          
+          echo "Server is READY and WAITING on $IP:$SSH_PORT"
+          echo "Run this command to connect:"
+          echo "  ssh -o StrictHostKeyChecking=no -p $SSH_PORT tmpuser@$IP"
+          echo ""
+          
+          # Monitor loop - keep alive for up to 360 cycles
+          timeout_counter=0
+          max_timeouts=360  # 6 hours worth of checks (360 x 60s)
+          last_client_check=0
+          connected=false
+          
+          while [ $timeout_counter -lt $max_timeouts ]; do
+            # Check if sshd is still running
+            if ! pgrep -x sshd > /dev/null 2>&1; then
+              echo "[$(date)] sshd not running! Restarting..."
+              sudo /usr/sbin/sshd -p $SSH_PORT -o "ListenAddress=0.0.0.0" &
+              sleep 3
+            fi
+            
+            # Check port is still listening
+            if ! sudo ss -tlnp | grep -q ":$SSH_PORT "; then
+              echo "[$(date)] Port $SSH_PORT not listening! Restarting..."
+              sudo /usr/sbin/sshd -p $SSH_PORT -o "ListenAddress=0.0.0.0" &
+              sleep 3
+            fi
+            
+            # Check for active SSH sessions
+            active_sessions=$(sudo ss -tnp | grep ":$SSH_PORT " | grep ESTAB | wc -l)
+            if [ "$active_sessions" -gt 0 ]; then
+              connected=true
+              echo "[$(date)] 👤Client connected! ($active_sessions active session(s))"
+              echo "[$(date)] Keep trying... Workflow continues"
+            else
+              if [ "$connected" = false ]; then
+                # Only print waiting message every 5 minutes
+                if [ $((timeout_counter % 5)) -eq 0 ]; then
+                  echo "[$(date)] 🔄 Waiting for SSH connection on $IP:$SSH_PORT..."
+                  echo "[$(date)] Run: ssh -o StrictHostKeyChecking=no -p $SSH_PORT tmpuser@$IP"
+                fi
+              fi
+              connected=false
+            fi
+            
+            # Print progress
+            hours=$((timeout_counter / 60))
+            mins=$((timeout_counter % 60))
+            if [ $((timeout_counter % 10)) -eq 0 ]; then
+              echo "[$(date)] Uptime: ${hours}h ${mins}m / 6h max"
+            fi
+            
+            timeout_counter=$((timeout_counter + 1))
+            sleep 60
+          done
+          
+          echo "Timeout reached (6 hours). Workflow ending."
